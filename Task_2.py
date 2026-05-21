@@ -1,15 +1,14 @@
 import csv
 from pathlib import Path
-
 import matplotlib.pyplot as plt
 
-
 BASE_DIR = Path(__file__).parent
-DISK_DIR = BASE_DIR / "out_fixed" / "xfs"   # /mnt (SSD)
-SHM_DIR  = BASE_DIR / "out_fixed" / "xfs_2"   # /dev/shm (RAM)
+DISK_DIR = BASE_DIR / "out_fixed" / "xfs"
+SHM_DIR = BASE_DIR / "out_fixed" / "xfs_2"
 
 
-def parse_last_row(path: Path):
+# reads the last data row of a bonnie++ csv log
+def parse_last_row(path):
     with path.open() as f:
         rows = list(csv.reader(f))
 
@@ -43,35 +42,42 @@ def parse_last_row(path: Path):
         "get_block_latency": get("get_block_latency"),
         "seeks": get_float("seeks"),
         "seeks_latency": get("seeks_latency"),
+        "ran_create": get_float("ran_create"),
+        "ran_create_latency": get("ran_create_latency"),
+        # seq_create throughput is always +++++ in our logs
+        "seq_create_latency": get("seq_create_latency"),
     }
 
 
-def latency_to_us(lat_str: str):
+# converts bonnie++ latency strings like "306us" or "14ms" to microseconds
+def latency_to_us(lat_str):
     if not lat_str:
         return None
     s = lat_str.strip()
     if s.endswith("us"):
-        s = s[:-2]
-        factor = 1.0
+        return float(s[:-2])
     elif s.endswith("ms"):
-        s = s[:-2]
-        factor = 1000.0
-    else:
-        factor = 1.0
+        return float(s[:-2]) * 1000.0
     try:
-        return float(s) * factor
+        return float(s)
     except ValueError:
         return None
 
 
-def load_env(directory: Path):
+def load_env(directory):
     sizes = []
-    put_block = []
-    put_block_lat = []
-    get_block = []
-    get_block_lat = []
-    seeks = []
-    seeks_lat = []
+    put_block = []; put_block_lat = []
+    get_block = []; get_block_lat = []
+    seeks = []; seeks_lat = []
+    ran_create = []; ran_create_lat = []
+    seq_create_lat = []
+
+    metrics = [
+        (put_block, put_block_lat, "put_block", "put_block_latency"),
+        (get_block, get_block_lat, "get_block", "get_block_latency"),
+        (seeks, seeks_lat, "seeks", "seeks_latency"),
+        (ran_create, ran_create_lat, "ran_create", "ran_create_latency"),
+    ]
 
     for path in sorted(directory.glob("*.log")):
         parsed = parse_last_row(path)
@@ -80,51 +86,59 @@ def load_env(directory: Path):
 
         sizes.append(parsed["file_size"])
 
-        def add(metric_list, lat_list, t_key, l_key):
-            t = parsed[t_key]
-            lat_raw = parsed[l_key]
-            l = latency_to_us(lat_raw) if lat_raw is not None else None
+        for ml, ll, tk, lk in metrics:
+            t = parsed[tk]
+            l = latency_to_us(parsed[lk]) if parsed[lk] is not None else None
             if t is not None and l is not None:
-                metric_list.append(t)
-                lat_list.append(l)
+                ml.append(t)
+                ll.append(l)
 
-        add(put_block, put_block_lat, "put_block", "put_block_latency")
-        add(get_block, get_block_lat, "get_block", "get_block_latency")
-        add(seeks, seeks_lat, "seeks", "seeks_latency")
+        # seq_create has no throughput so just grab latency
+        l = latency_to_us(parsed["seq_create_latency"]) if parsed["seq_create_latency"] else None
+        if l is not None:
+            seq_create_lat.append(l)
 
     return {
         "sizes": sizes,
-        "put_block": put_block,
-        "put_block_lat": put_block_lat,
-        "get_block": get_block,
-        "get_block_lat": get_block_lat,
-        "seeks": seeks,
-        "seeks_lat": seeks_lat,
+        "put_block": put_block, "put_block_lat": put_block_lat,
+        "get_block": get_block, "get_block_lat": get_block_lat,
+        "seeks": seeks, "seeks_lat": seeks_lat,
+        "ran_create": ran_create, "ran_create_lat": ran_create_lat,
+        "seq_create_lat": seq_create_lat,
     }
 
 
-def scatter_tp_vs_lat(disk_vals, shm_vals, key_tp, key_lat,
-                      title, tp_label, lat_label, filename=None):
+def scatter_tp_vs_lat(vals1, vals2, key_tp, key_lat, title, tp_label, lat_label, filename=None):
     plt.figure(figsize=(6, 4))
-    plt.scatter(
-        disk_vals[key_tp],
-        disk_vals[key_lat],
-        marker="o",
-        color="tab:blue",
-        label="xfs on disk (/mnt)",
-    )
-    plt.scatter(
-        shm_vals[key_tp],
-        shm_vals[key_lat],
-        marker="s",
-        color="tab:orange",
-        label="xfs on /dev/shm",
-    )
+    plt.scatter(vals1[key_tp], vals1[key_lat], marker="o", color="tab:blue", label="xfs on disk (/mnt)")
+    plt.scatter(vals2[key_tp], vals2[key_lat], marker="s", color="tab:orange", label="xfs on /dev/shm")
     plt.xlabel(tp_label)
     plt.ylabel(lat_label)
     plt.title(title)
-    plt.grid(True, which="both", linestyle="--", alpha=0.3)
+    plt.grid(True, linestyle="--", alpha=0.3)
     plt.legend()
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename, dpi=150)
+
+
+# bar chart for seq_create since throughput is always +++++ in both datasets
+def bar_seq_create_latency(disk_vals, shm_vals, filename=None):
+    n = min(len(disk_vals["seq_create_lat"]), len(shm_vals["seq_create_lat"]))
+    sizes = disk_vals["sizes"][:n]
+    x = list(range(n))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar([i - width/2 for i in x], disk_vals["seq_create_lat"][:n], width, label="xfs on disk (/mnt)", color="tab:blue")
+    ax.bar([i + width/2 for i in x], shm_vals["seq_create_lat"][:n], width, label="xfs on /dev/shm", color="tab:orange")
+    ax.set_xticks(x)
+    ax.set_xticklabels(sizes)
+    ax.set_xlabel("File size")
+    ax.set_ylabel("seq_create latency (µs)")
+    ax.set_title("Sequential create latency: xfs disk vs /dev/shm")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.legend()
     plt.tight_layout()
     if filename:
         plt.savefig(filename, dpi=150)
@@ -132,43 +146,29 @@ def scatter_tp_vs_lat(disk_vals, shm_vals, key_tp, key_lat,
 
 def main():
     disk = load_env(DISK_DIR)
-    shm  = load_env(SHM_DIR)
+    shm = load_env(SHM_DIR)
 
-    # Sequential write
-    scatter_tp_vs_lat(
-        disk,
-        shm,
-        "put_block",
-        "put_block_lat",
+    scatter_tp_vs_lat(disk, shm, "put_block", "put_block_lat",
         "Sequential write: xfs disk vs /dev/shm",
-        "put_block throughput (MB/s)",
-        "put_block latency (µs)",
-        filename="task2_xfs_write_tp_lat.png",
-    )
+        "put_block throughput (MB/s)", "put_block latency (µs)",
+        filename="task2_xfs_write_tp_lat.png")
 
-    # Sequential read
-    scatter_tp_vs_lat(
-        disk,
-        shm,
-        "get_block",
-        "get_block_lat",
+    scatter_tp_vs_lat(disk, shm, "get_block", "get_block_lat",
         "Sequential read: xfs disk vs /dev/shm",
-        "get_block throughput (MB/s)",
-        "get_block latency (µs)",
-        filename="task2_xfs_read_tp_lat.png",
-    )
+        "get_block throughput (MB/s)", "get_block latency (µs)",
+        filename="task2_xfs_read_tp_lat.png")
 
-    # Seeks (if present)
-    scatter_tp_vs_lat(
-        disk,
-        shm,
-        "seeks",
-        "seeks_lat",
+    scatter_tp_vs_lat(disk, shm, "seeks", "seeks_lat",
         "Random seeks: xfs disk vs /dev/shm",
-        "seeks (ops/s)",
-        "seeks latency (µs)",
-        filename="task2_xfs_seeks_tp_lat.png",
-    )
+        "seeks (ops/s)", "seeks latency (µs)",
+        filename="task2_xfs_seeks_tp_lat.png")
+
+    bar_seq_create_latency(disk, shm, filename="task2_xfs_seq_create_lat.png")
+
+    scatter_tp_vs_lat(disk, shm, "ran_create", "ran_create_lat",
+        "Random create: xfs disk vs /dev/shm",
+        "ran_create (files/s)", "ran_create latency (µs)",
+        filename="task2_xfs_ran_create_tp_lat.png")
 
     plt.show()
 
